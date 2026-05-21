@@ -4,7 +4,8 @@ llama.cpp:
 1. Download and set up llama.cpp
 https://github.com/ggml-org/llama.cpp
 2. Build llama.ccp
-3. Make sure llama-cli is in the path.
+3. Make sure llama-server is in the path with "which llama-server"
+4. if empty, set to <llama_cpp_dir>/llama.cpp/build/bin/llama-server
 
 pyhon:
 1. create new .venv
