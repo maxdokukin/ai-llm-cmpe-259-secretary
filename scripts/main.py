@@ -24,8 +24,8 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # --- Logic Configuration ---
 from src.ToolManager.ToolManager import ToolManager
 
-CTX_SERVER = "http://localhost:7999/api/context"
-LLM_SERVER = "http://localhost:8080/v1"
+CTX_SERVER = "http://127.0.0.1:7999/api/context"
+LLM_SERVER = "http://127.0.0.1:8080/v1"
 # LLM_SERVER = "http://10.0.0.43:8080/v1"
 
 # --- Sample Data Index ---
