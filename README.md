@@ -323,7 +323,7 @@ retrieved data used by the assistant
 
 ---
 
-### Prompt Caching / Model Distillation (EE)
+### Prompt Caching / Model Distillation
 
 This project addresses the prompt caching part of the EE requirement at the ContextManager level.
 
@@ -361,7 +361,7 @@ The model comparison between E4B and 26B also helps evaluate whether a smaller m
 
 ---
 
-### Security Testing (EE)
+### Security Testing
 
 Security testing was performed with adversarial prompts designed to test prompt injection, data leakage, raw tool-output leakage, and unsafe database modification requests.
 
@@ -405,7 +405,7 @@ This means that even if the model attempts to call the SQL tool with a destructi
 ## System Architecture
 
 The project uses a multi-server architecture so each part of the system can be inspected, replaced, or moved between local and remote machines.
-
+![sys_arch.png](doc/sys_arch.png)
 ```text
 User Browser
     |
@@ -480,7 +480,7 @@ This allows the assistant to reason, retrieve data, use tools, and continue gene
 ### ContextManager
 
 The ContextManager tracks and stores session context.
-
+![ctx_win.png](doc/ctx_win.png)
 It manages these context segments:
 
 ```text
