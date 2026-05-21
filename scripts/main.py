@@ -29,7 +29,7 @@ LLM_SERVER = "http://localhost:8080/v1"
 # LLM_SERVER = "http://10.0.0.43:8080/v1"
 
 # --- Sample Data Index ---
-from src.data.supabase import fetch_db_index
+from src.data.sqlite import fetch_db_index
 
 
 @app.get("/")

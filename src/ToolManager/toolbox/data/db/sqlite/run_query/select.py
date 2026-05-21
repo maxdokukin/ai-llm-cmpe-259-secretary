@@ -1,20 +1,22 @@
-import os
 import json
+import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+import sqlite3
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from dotenv import load_dotenv
-from supabase import create_client, Client
 
+DB_PATH = Path(__file__).resolve().parents[7] / "data" / "test" / "synthetic_data.sqlite"
+
+returns_data = True
 
 tool_schema = {
     "type": "function",
     "function": {
-        "name": "execute",
+        "name": "sqlite_select",
         "description": (
-            "Executes a restricted, read-only PostgreSQL-style SELECT query "
-            "through the Supabase client. Supports simple SELECT/FROM/WHERE/"
-            "ORDER BY/LIMIT queries only."
+            "Executes a restricted, read-only SQLite SELECT query. "
+            "Supports simple SELECT/FROM/WHERE/ORDER BY/LIMIT queries only."
         ),
         "parameters": {
             "type": "object",
@@ -25,7 +27,10 @@ tool_schema = {
                         "A restricted SELECT query. Supported shape: "
                         "SELECT columns FROM table "
                         "[WHERE col op value [AND col op value ...]] "
-                        "[ORDER BY col ASC|DESC] [LIMIT n]"
+                        "[ORDER BY col ASC|DESC] [LIMIT n]. "
+                        "Examples: "
+                        "SELECT * FROM projects LIMIT 5; "
+                        "SELECT id, title FROM projects WHERE slug = 'dune-buggy';"
                     ),
                 }
             },
@@ -36,7 +41,7 @@ tool_schema = {
 
 
 _IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
-_TABLE_IDENTIFIER = rf"(?:{_IDENTIFIER}\.)?{_IDENTIFIER}"
+_TABLE_IDENTIFIER = _IDENTIFIER
 
 _FORBIDDEN_KEYWORDS = [
     "INSERT",
@@ -63,8 +68,10 @@ _FORBIDDEN_KEYWORDS = [
     "DO",
     "BEGIN",
     "END",
+    "ATTACH",
+    "DETACH",
+    "PRAGMA",
 ]
-
 
 _SELECT_RE = re.compile(
     rf"""
@@ -78,7 +85,6 @@ _SELECT_RE = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE | re.DOTALL,
 )
-
 
 _CONDITION_RE = re.compile(
     rf"""
@@ -94,29 +100,14 @@ _CONDITION_RE = re.compile(
 )
 
 
-def _get_supabase_client() -> Client:
-    load_dotenv()
+def _get_db_path() -> Path:
+    return Path(os.environ.get("SQLITE_DB_PATH", DB_PATH)).expanduser().resolve()
 
-    supabase_url = os.environ.get("SUPABASE_URL")
-    supabase_key = (
-        os.environ.get("SUPABASE_KEY")
-        or os.environ.get("SUPABASE_ANON_KEY")
-        or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    )
 
-    if not supabase_url:
-        raise ValueError("SUPABASE_URL is missing from environment variables.")
-
-    if not supabase_key:
-        raise ValueError(
-            "SUPABASE_KEY is missing from environment variables. "
-            "You may also use SUPABASE_ANON_KEY or SUPABASE_SERVICE_ROLE_KEY."
-        )
-
-    if not supabase_url.startswith(("http://", "https://")):
-        raise ValueError("SUPABASE_URL must be your Supabase HTTPS project URL.")
-
-    return create_client(supabase_url, supabase_key)
+def _connect(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def _reject_comments(query: str) -> bool:
@@ -157,11 +148,11 @@ def _is_query_safe(query: str) -> bool:
     return True
 
 
-def _parse_columns(columns: str) -> str:
+def _parse_columns(columns: str) -> List[str]:
     columns = columns.strip()
 
     if columns == "*":
-        return "*"
+        return ["*"]
 
     parts = [part.strip() for part in columns.split(",")]
 
@@ -175,7 +166,7 @@ def _parse_columns(columns: str) -> str:
                 "Aliases, functions, casts, and expressions are not allowed."
             )
 
-    return ",".join(parts)
+    return parts
 
 
 def _split_outside_quotes_and_parens(value: str, separator: str) -> List[str]:
@@ -197,7 +188,6 @@ def _split_outside_quotes_and_parens(value: str, separator: str) -> List[str]:
                     i += 1
                 else:
                     quote = None
-
         else:
             if ch in ("'", '"'):
                 quote = ch
@@ -256,18 +246,10 @@ def _parse_literal(raw: str) -> Any:
     if upper == "FALSE":
         return False
 
-    if (
-        len(value) >= 2
-        and value[0] == "'"
-        and value[-1] == "'"
-    ):
+    if len(value) >= 2 and value[0] == "'" and value[-1] == "'":
         return value[1:-1].replace("''", "'")
 
-    if (
-        len(value) >= 2
-        and value[0] == '"'
-        and value[-1] == '"'
-    ):
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
         return value[1:-1].replace('""', '"')
 
     if re.fullmatch(r"-?\d+", value):
@@ -357,63 +339,162 @@ def _parse_query(query: str) -> Dict[str, Any]:
     }
 
 
-def _apply_condition(builder: Any, condition: Dict[str, Any]) -> Any:
-    column = condition["column"]
-    operator = condition["operator"]
-    value = condition["value"]
+def _quote_identifier(identifier: str) -> str:
+    if not re.fullmatch(_IDENTIFIER, identifier):
+        raise ValueError(f"Invalid identifier: {identifier!r}")
+    return f'"{identifier}"'
 
-    if operator == "=":
-        return builder.eq(column, value)
 
-    if operator in ("!=", "<>"):
-        return builder.neq(column, value)
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?
+        """,
+        (table_name,),
+    ).fetchone()
+    return row is not None
 
-    if operator == ">":
-        return builder.gt(column, value)
 
-    if operator == ">=":
-        return builder.gte(column, value)
+def _get_table_columns(conn: sqlite3.Connection, table_name: str) -> List[str]:
+    rows = conn.execute(f"PRAGMA table_info({_quote_identifier(table_name)})").fetchall()
+    return [row["name"] for row in rows]
 
-    if operator == "<":
-        return builder.lt(column, value)
 
-    if operator == "<=":
-        return builder.lte(column, value)
+def _validate_column(column: str, available_columns: Sequence[str]) -> None:
+    if column not in available_columns:
+        raise ValueError(f"Column '{column}' not found in table.")
 
-    if operator == "LIKE":
-        return builder.like(column, value)
 
-    if operator == "ILIKE":
-        return builder.ilike(column, value)
+def _sqlite_value(value: Any) -> Any:
+    if value is True:
+        return 1
+    if value is False:
+        return 0
+    return value
 
-    if operator == "IS":
-        if value is None:
-            return builder.is_(column, "null")
-        if value is True:
-            return builder.is_(column, "true")
-        if value is False:
-            return builder.is_(column, "false")
-        raise ValueError("IS only supports NULL, TRUE, or FALSE.")
 
-    if operator == "IN":
-        return builder.in_(column, value)
+def _build_where_clause(
+    conditions: Sequence[Dict[str, Any]],
+    available_columns: Sequence[str],
+) -> Tuple[str, List[Any]]:
+    if not conditions:
+        return "", []
 
-    raise ValueError(f"Unsupported operator: {operator}")
+    clauses = []
+    params: List[Any] = []
+
+    for condition in conditions:
+        column = condition["column"]
+        operator = condition["operator"]
+        value = condition["value"]
+
+        _validate_column(column, available_columns)
+        quoted_column = _quote_identifier(column)
+
+        if operator == "=":
+            if value is None:
+                clauses.append(f"{quoted_column} IS NULL")
+            else:
+                clauses.append(f"{quoted_column} = ?")
+                params.append(_sqlite_value(value))
+
+        elif operator in ("!=", "<>"):
+            if value is None:
+                clauses.append(f"{quoted_column} IS NOT NULL")
+            else:
+                clauses.append(f"{quoted_column} != ?")
+                params.append(_sqlite_value(value))
+
+        elif operator in (">", ">=", "<", "<="):
+            if value is None:
+                raise ValueError(f"Operator {operator} does not support NULL.")
+            clauses.append(f"{quoted_column} {operator} ?")
+            params.append(_sqlite_value(value))
+
+        elif operator == "LIKE":
+            if not isinstance(value, str):
+                raise ValueError("LIKE requires a quoted string value.")
+            clauses.append(f"{quoted_column} LIKE ?")
+            params.append(value)
+
+        elif operator == "ILIKE":
+            if not isinstance(value, str):
+                raise ValueError("ILIKE requires a quoted string value.")
+            clauses.append(f"LOWER({quoted_column}) LIKE LOWER(?)")
+            params.append(value)
+
+        elif operator == "IS":
+            if value is None:
+                clauses.append(f"{quoted_column} IS NULL")
+            elif value is True:
+                clauses.append(f"{quoted_column} IS 1")
+            elif value is False:
+                clauses.append(f"{quoted_column} IS 0")
+            else:
+                raise ValueError("IS only supports NULL, TRUE, or FALSE.")
+
+        elif operator == "IN":
+            if not isinstance(value, list):
+                raise ValueError("IN requires a list of values.")
+            if not value:
+                raise ValueError("IN list cannot be empty.")
+
+            placeholders = ", ".join("?" for _ in value)
+            clauses.append(f"{quoted_column} IN ({placeholders})")
+            params.extend(_sqlite_value(item) for item in value)
+
+        else:
+            raise ValueError(f"Unsupported operator: {operator}")
+
+    return " WHERE " + " AND ".join(clauses), params
+
+
+def _build_sql(conn: sqlite3.Connection, parsed: Dict[str, Any]) -> Tuple[str, List[Any]]:
+    table_name = parsed["table"]
+
+    if not _table_exists(conn, table_name):
+        raise ValueError(f"Table '{table_name}' not found in database.")
+
+    available_columns = _get_table_columns(conn, table_name)
+    if not available_columns:
+        raise ValueError(f"Table '{table_name}' has no columns.")
+
+    if parsed["columns"] == ["*"]:
+        select_sql = "*"
+    else:
+        for column in parsed["columns"]:
+            _validate_column(column, available_columns)
+        select_sql = ", ".join(_quote_identifier(column) for column in parsed["columns"])
+
+    where_sql, params = _build_where_clause(parsed["conditions"], available_columns)
+
+    order_sql = ""
+    if parsed["order_col"]:
+        _validate_column(parsed["order_col"], available_columns)
+        order_sql = (
+            f" ORDER BY {_quote_identifier(parsed['order_col'])} "
+            f"{parsed['order_dir']}"
+        )
+
+    limit_sql = ""
+    if parsed["limit"] is not None:
+        limit_sql = " LIMIT ?"
+        params.append(parsed["limit"])
+
+    sql = (
+        f"SELECT {select_sql} "
+        f"FROM {_quote_identifier(table_name)}"
+        f"{where_sql}"
+        f"{order_sql}"
+        f"{limit_sql}"
+    )
+
+    return sql, params
 
 
 def execute(query: str) -> str:
-    """
-    Executes a restricted, read-only Supabase SELECT query.
-
-    Supported examples:
-        SELECT * FROM todos;
-        SELECT id, name FROM todos LIMIT 10;
-        SELECT id, name FROM todos WHERE completed = false;
-        SELECT id, name FROM todos WHERE user_id = 'abc' AND completed = false ORDER BY created_at DESC LIMIT 20;
-
-    Returns:
-        JSON string of rows, or an error string.
-    """
     try:
         if not _is_query_safe(query):
             return (
@@ -422,34 +503,21 @@ def execute(query: str) -> str:
                 "are blocked."
             )
 
+        db_path = _get_db_path()
+        if not db_path.exists():
+            return f"Error: SQLite database not found at: {db_path}"
+
         parsed = _parse_query(query)
-        supabase = _get_supabase_client()
 
-        table_name = parsed["table"]
+        with _connect(db_path) as conn:
+            sql, params = _build_sql(conn, parsed)
+            rows = conn.execute(sql, params).fetchall()
 
-        if "." in table_name:
-            schema_name, plain_table_name = table_name.split(".", 1)
-            builder = supabase.schema(schema_name).table(plain_table_name)
-        else:
-            builder = supabase.table(table_name)
-
-        request = builder.select(parsed["columns"])
-
-        for condition in parsed["conditions"]:
-            request = _apply_condition(request, condition)
-
-        if parsed["order_col"]:
-            request = request.order(
-                parsed["order_col"],
-                desc=parsed["order_dir"] == "DESC",
-            )
-
-        if parsed["limit"] is not None:
-            request = request.limit(parsed["limit"])
-
-        response = request.execute()
-
-        return json.dumps(response.data, default=str)
+        return json.dumps([dict(row) for row in rows], default=str)
 
     except Exception as e:
         return f"Error executing query: {str(e)}"
+
+
+if __name__ == "__main__":
+    print(execute("SELECT id, title, slug FROM projects ORDER BY ranking ASC LIMIT 5"))
